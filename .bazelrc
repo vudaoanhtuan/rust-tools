@@ -1,0 +1,8 @@
+# Common settings
+common --enable_bzlmod
+
+# Build settings
+build --incompatible_strict_action_env
+
+# Test settings
+test --test_output=errors
