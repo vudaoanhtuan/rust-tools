@@ -5,12 +5,26 @@ module(
     version = "0.1.0",
 )
 
-# Rust rules
+# Rust rules - use a newer version with updated cargo-bazel
 bazel_dep(name = "rules_rust", version = "0.68.1")
 
 # Register Rust toolchains
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
-    edition = "2024",
-    versions = [ "1.85.0" ],
+    edition = "2021",
+    versions = ["1.85.0"],
 )
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# Crate universe for Cargo dependencies
+crate = use_extension("@rules_rust//crate_universe:extension.bzl", "crate")
+
+crate.from_cargo(
+    name = "shared_drive_crates",
+    cargo_lockfile = "//shared_drive:Cargo.lock",
+    manifests = ["//shared_drive:Cargo.toml"],
+)
+
+use_repo(crate, "shared_drive_crates")

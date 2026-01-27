@@ -1,0 +1,27 @@
+load("@shared_drive_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+rust_library(
+    name = "share_drive_lib",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    crate_name = "share_drive",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(),
+)
+
+rust_binary(
+    name = "share_drive",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":share_drive_lib",
+    ] + all_crate_deps(),
+)
+
+rust_test(
+    name = "lib_test",
+    crate = ":share_drive_lib",
+    deps = all_crate_deps(normal_dev = True),
+)

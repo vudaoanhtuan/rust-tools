@@ -1,0 +1,28 @@
+load("@shared_drive_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_test")
+
+rust_test(
+    name = "url_parser_test",
+    srcs = ["url_parser_test.rs"],
+    edition = "2021",
+    deps = [
+        "//shared_drive:share_drive_lib",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+        package_name = "shared_drive",
+    ),
+)
+
+rust_test(
+    name = "client_test",
+    srcs = ["client_test.rs"],
+    edition = "2021",
+    deps = [
+        "//shared_drive:share_drive_lib",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+        package_name = "shared_drive",
+    ),
+)
