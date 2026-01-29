@@ -32,7 +32,7 @@ pub mod url_parser;
 
 // Re-exports for convenience
 pub use auth::Authenticator;
-pub use client::{ProgressCallback, SharedDriveClient, UploadProgress};
+pub use client::{ProgressCallback, SharedDriveClient, TransferProgress, UploadProgress};
 pub use error::{DriveError, Result};
-pub use models::FileMetadata;
+pub use models::{format_eta, format_size, FileMetadata};
 pub use url_parser::extract_id;

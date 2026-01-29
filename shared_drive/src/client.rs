@@ -29,19 +29,42 @@ const RESUMABLE_THRESHOLD: u64 = 50 * 1024 * 1024;
 /// Google recommends multiples of 256 KB; larger chunks are more efficient.
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
-/// Progress information for file uploads.
+/// Progress information for file transfers (uploads and downloads).
 #[derive(Debug, Clone)]
-pub struct UploadProgress {
-    /// Number of bytes uploaded so far.
-    pub bytes_uploaded: u64,
+pub struct TransferProgress {
+    /// Number of bytes transferred so far.
+    pub bytes_transferred: u64,
     /// Total file size in bytes.
     pub total_bytes: u64,
-    /// Current upload speed in bytes per second.
+    /// Current transfer speed in bytes per second.
     pub bytes_per_second: f64,
 }
 
-/// Callback type for upload progress notifications.
-pub type ProgressCallback = Arc<dyn Fn(UploadProgress) + Send + Sync>;
+impl TransferProgress {
+    /// Calculate the remaining time in seconds based on current speed.
+    /// Returns None if speed is zero or calculation is not possible.
+    pub fn eta_seconds(&self) -> Option<f64> {
+        if self.bytes_per_second <= 0.0 {
+            return None;
+        }
+        let remaining = self.total_bytes.saturating_sub(self.bytes_transferred);
+        Some(remaining as f64 / self.bytes_per_second)
+    }
+
+    /// Calculate the progress percentage (0.0 - 100.0).
+    pub fn percent(&self) -> f64 {
+        if self.total_bytes == 0 {
+            return 100.0;
+        }
+        (self.bytes_transferred as f64 / self.total_bytes as f64) * 100.0
+    }
+}
+
+/// Type alias for backward compatibility.
+pub type UploadProgress = TransferProgress;
+
+/// Callback type for transfer progress notifications.
+pub type ProgressCallback = Arc<dyn Fn(TransferProgress) + Send + Sync>;
 
 /// Client for interacting with Google Shared Drive.
 pub struct SharedDriveClient {
@@ -440,8 +463,8 @@ impl SharedDriveClient {
                         0.0
                     };
 
-                    callback(UploadProgress {
-                        bytes_uploaded,
+                    callback(TransferProgress {
+                        bytes_transferred: bytes_uploaded,
                         total_bytes: file_size,
                         bytes_per_second: speed,
                     });
@@ -456,8 +479,8 @@ impl SharedDriveClient {
                         0.0
                     };
 
-                    callback(UploadProgress {
-                        bytes_uploaded: file_size,
+                    callback(TransferProgress {
+                        bytes_transferred: file_size,
                         total_bytes: file_size,
                         bytes_per_second: speed,
                     });
@@ -491,11 +514,27 @@ impl SharedDriveClient {
         file_id: &str,
         destination: P,
     ) -> Result<FileMetadata> {
+        self.download_file_with_progress(file_id, destination, None).await
+    }
+
+    /// Download a file to a local path with progress reporting.
+    ///
+    /// # Arguments
+    /// * `file_id` - The ID of the file to download
+    /// * `destination` - The local path to save the file
+    /// * `progress` - Optional callback for progress updates
+    pub async fn download_file_with_progress<P: AsRef<Path>>(
+        &self,
+        file_id: &str,
+        destination: P,
+        progress: Option<ProgressCallback>,
+    ) -> Result<FileMetadata> {
         let token = self.auth.get_access_token().await?;
         let destination = destination.as_ref();
 
         // Get file metadata first
         let metadata = self.get_file(file_id).await?;
+        let total_bytes = metadata.size.unwrap_or(0);
 
         // Determine the final path
         let final_path = if destination.is_dir() {
@@ -522,20 +561,41 @@ impl SharedDriveClient {
             });
         }
 
-        // Stream to file
+        // Stream to file with progress tracking
         let path_str = final_path.display().to_string();
         let mut file = File::create(&final_path).await.map_err(|e| DriveError::FileWriteError {
             path: path_str.clone(),
             source: e,
         })?;
         let mut stream = response.bytes_stream();
+        let mut bytes_downloaded: u64 = 0;
+        let start_time = Instant::now();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
+            let chunk_len = chunk.len() as u64;
             file.write_all(&chunk).await.map_err(|e| DriveError::FileWriteError {
                 path: path_str.clone(),
                 source: e,
             })?;
+
+            bytes_downloaded += chunk_len;
+
+            // Report progress
+            if let Some(ref callback) = progress {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let speed = if elapsed > 0.0 {
+                    bytes_downloaded as f64 / elapsed
+                } else {
+                    0.0
+                };
+
+                callback(TransferProgress {
+                    bytes_transferred: bytes_downloaded,
+                    total_bytes,
+                    bytes_per_second: speed,
+                });
+            }
         }
 
         file.flush().await.map_err(|e| DriveError::FileWriteError {

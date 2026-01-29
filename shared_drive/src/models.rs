@@ -39,7 +39,7 @@ impl std::fmt::Display for FileMetadata {
 }
 
 /// Format bytes into human-readable size.
-fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
@@ -52,6 +52,31 @@ fn format_size(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+/// Format seconds into human-readable time (e.g., "2m 15s", "1h 5m", "< 1s").
+pub fn format_eta(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "--".to_string();
+    }
+
+    let secs = seconds.round() as u64;
+
+    if secs == 0 {
+        return "< 1s".to_string();
+    }
+
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let remaining_secs = secs % 60;
+
+    if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, remaining_secs)
+    } else {
+        format!("{}s", remaining_secs)
     }
 }
 
@@ -137,6 +162,17 @@ mod tests {
         assert_eq!(format_size(1536), "1.50 KB");
         assert_eq!(format_size(1048576), "1.00 MB");
         assert_eq!(format_size(1073741824), "1.00 GB");
+    }
+
+    #[test]
+    fn test_format_eta() {
+        assert_eq!(format_eta(0.4), "< 1s");
+        assert_eq!(format_eta(5.0), "5s");
+        assert_eq!(format_eta(65.0), "1m 5s");
+        assert_eq!(format_eta(3665.0), "1h 1m");
+        assert_eq!(format_eta(f64::INFINITY), "--");
+        assert_eq!(format_eta(-5.0), "--");
+        assert_eq!(format_eta(f64::NAN), "--");
     }
 
     #[test]

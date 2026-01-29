@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use glob::glob;
 
-use share_drive::{extract_id, Authenticator, SharedDriveClient, UploadProgress};
+use share_drive::{extract_id, format_eta, format_size, Authenticator, SharedDriveClient, TransferProgress};
 
 /// CLI tool for interacting with Google Shared Drive.
 #[derive(Parser)]
@@ -137,11 +137,19 @@ async fn main() -> Result<()> {
                 std::io::stdout().flush().ok();
 
                 // Create progress callback for large files
-                let progress_callback: Arc<dyn Fn(UploadProgress) + Send + Sync> =
-                    Arc::new(|p: UploadProgress| {
-                        let percent = (p.bytes_uploaded as f64 / p.total_bytes as f64) * 100.0;
+                let progress_callback: Arc<dyn Fn(TransferProgress) + Send + Sync> =
+                    Arc::new(|p: TransferProgress| {
+                        let percent = p.percent();
+                        let transferred = format_size(p.bytes_transferred);
+                        let total = format_size(p.total_bytes);
                         let speed_mb = p.bytes_per_second / (1024.0 * 1024.0);
-                        print!("\r[{:.1}%] {:.2} MB/s   ", percent, speed_mb);
+                        let eta = p.eta_seconds()
+                            .map(format_eta)
+                            .unwrap_or_else(|| "--".to_string());
+                        print!(
+                            "\r[{:.1}%] {} / {} | {:.2} MB/s | ETA: {}   ",
+                            percent, transferred, total, speed_mb, eta
+                        );
                         std::io::stdout().flush().ok();
                     });
 
@@ -180,10 +188,27 @@ async fn main() -> Result<()> {
                 }
             }
 
-            print!("Downloading {}... ", file_id);
+            println!("Downloading {}...", file_id);
+
+            // Create progress callback for downloads
+            let progress_callback: Arc<dyn Fn(TransferProgress) + Send + Sync> =
+                Arc::new(|p: TransferProgress| {
+                    let percent = p.percent();
+                    let transferred = format_size(p.bytes_transferred);
+                    let total = format_size(p.total_bytes);
+                    let speed_mb = p.bytes_per_second / (1024.0 * 1024.0);
+                    let eta = p.eta_seconds()
+                        .map(format_eta)
+                        .unwrap_or_else(|| "--".to_string());
+                    print!(
+                        "\r[{:.1}%] {} / {} | {:.2} MB/s | ETA: {}   ",
+                        percent, transferred, total, speed_mb, eta
+                    );
+                    std::io::stdout().flush().ok();
+                });
 
             let metadata = client
-                .download_file(&file_id, &to)
+                .download_file_with_progress(&file_id, &to, Some(progress_callback))
                 .await
                 .with_context(|| format!("Failed to download file: {}", file_id))?;
 
@@ -193,7 +218,7 @@ async fn main() -> Result<()> {
                 to
             };
 
-            println!("OK");
+            println!("\rDownload complete!                                        ");
             println!("Saved to: {:?}", final_path);
         }
     }
