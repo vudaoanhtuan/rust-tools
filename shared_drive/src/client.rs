@@ -1,12 +1,15 @@
 //! Google Drive API client for Shared Drive operations.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 
 use futures::StreamExt;
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::io::ReaderStream;
 
 use crate::auth::Authenticator;
 use crate::error::{DriveError, Result};
@@ -18,8 +21,27 @@ const DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
 /// Upload URL for Google Drive API.
 const UPLOAD_API_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
 
-/// Threshold for resumable upload (500 MB).
-const RESUMABLE_THRESHOLD: u64 = 500 * 1024 * 1024;
+/// Threshold for resumable upload (50 MB).
+/// Files larger than this use chunked resumable upload with progress reporting.
+const RESUMABLE_THRESHOLD: u64 = 50 * 1024 * 1024;
+
+/// Chunk size for resumable uploads (8 MB).
+/// Google recommends multiples of 256 KB; larger chunks are more efficient.
+const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Progress information for file uploads.
+#[derive(Debug, Clone)]
+pub struct UploadProgress {
+    /// Number of bytes uploaded so far.
+    pub bytes_uploaded: u64,
+    /// Total file size in bytes.
+    pub total_bytes: u64,
+    /// Current upload speed in bytes per second.
+    pub bytes_per_second: f64,
+}
+
+/// Callback type for upload progress notifications.
+pub type ProgressCallback = Arc<dyn Fn(UploadProgress) + Send + Sync>;
 
 /// Client for interacting with Google Shared Drive.
 pub struct SharedDriveClient {
@@ -191,24 +213,48 @@ impl SharedDriveClient {
         local_path: P,
         parent_id: &str,
     ) -> Result<FileMetadata> {
+        self.upload_file_with_progress(local_path, parent_id, None).await
+    }
+
+    /// Upload a file to a folder with progress reporting.
+    ///
+    /// If a file with the same name exists, it will be overwritten.
+    ///
+    /// # Arguments
+    /// * `local_path` - Path to the local file
+    /// * `parent_id` - ID of the destination folder
+    /// * `progress` - Optional callback for progress updates
+    pub async fn upload_file_with_progress<P: AsRef<Path>>(
+        &self,
+        local_path: P,
+        parent_id: &str,
+        progress: Option<ProgressCallback>,
+    ) -> Result<FileMetadata> {
         let local_path = local_path.as_ref();
+        let path_str = local_path.display().to_string();
         let filename = local_path
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| DriveError::FileNotFound(local_path.display().to_string()))?;
+            .ok_or_else(|| DriveError::FileNotFound(path_str.clone()))?;
 
         // Check if file exists and delete it (overwrite behavior)
         if let Some(existing) = self.find_file(filename, parent_id).await? {
             self.delete_file(&existing.id).await?;
         }
 
-        let file_size = std::fs::metadata(local_path)?.len();
+        let file_size = std::fs::metadata(local_path)
+            .map_err(|e| DriveError::FileReadError {
+                path: path_str.clone(),
+                source: e,
+            })?
+            .len();
+
         let mime_type = mime_guess::from_path(local_path)
             .first_or_octet_stream()
             .to_string();
 
         if file_size > RESUMABLE_THRESHOLD {
-            self.upload_resumable(local_path, parent_id, filename, &mime_type)
+            self.upload_resumable(local_path, parent_id, filename, &mime_type, file_size, progress)
                 .await
         } else {
             self.upload_multipart(local_path, parent_id, filename, &mime_type)
@@ -225,7 +271,16 @@ impl SharedDriveClient {
         mime_type: &str,
     ) -> Result<FileMetadata> {
         let token = self.auth.get_access_token().await?;
-        let file_content = std::fs::read(local_path)?;
+        let path_str = local_path.display().to_string();
+
+        // Open file and create a stream instead of reading entire file into memory
+        let file = File::open(local_path).await.map_err(|e| DriveError::FileReadError {
+            path: path_str.clone(),
+            source: e,
+        })?;
+
+        let stream = ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
 
         let metadata = serde_json::json!({
             "name": filename,
@@ -236,7 +291,7 @@ impl SharedDriveClient {
         let metadata_part = Part::text(metadata.to_string())
             .mime_str("application/json")?;
 
-        let file_part = Part::bytes(file_content)
+        let file_part = Part::stream(body)
             .file_name(filename.to_string())
             .mime_str(mime_type)?;
 
@@ -277,16 +332,18 @@ impl SharedDriveClient {
     }
 
     /// Upload a file using resumable upload (for larger files).
+    /// Uploads in 8 MB chunks with progress reporting.
     async fn upload_resumable(
         &self,
         local_path: &Path,
         parent_id: &str,
         filename: &str,
         mime_type: &str,
+        file_size: u64,
+        progress: Option<ProgressCallback>,
     ) -> Result<FileMetadata> {
         let token = self.auth.get_access_token().await?;
-        let file_content = std::fs::read(local_path)?;
-        let file_size = file_content.len();
+        let path_str = local_path.display().to_string();
 
         let metadata = serde_json::json!({
             "name": filename,
@@ -331,28 +388,97 @@ impl SharedDriveClient {
             })?
             .to_string();
 
-        // Step 2: Upload the file content
-        let upload_response = self
-            .http
-            .put(&upload_url)
-            .header("Content-Type", mime_type)
-            .header("Content-Length", file_size.to_string())
-            .query(&[("fields", "id, name, size, mimeType, webViewLink")])
-            .body(file_content)
-            .send()
-            .await?;
+        // Step 2: Upload file in chunks with progress tracking
+        let mut file = File::open(local_path).await.map_err(|e| DriveError::FileReadError {
+            path: path_str.clone(),
+            source: e,
+        })?;
 
-        let status = upload_response.status();
-        if !status.is_success() {
-            let error_body = upload_response.text().await.unwrap_or_default();
-            return Err(DriveError::ApiError {
-                status: status.as_u16(),
-                message: error_body,
-            });
+        let mut bytes_uploaded: u64 = 0;
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        let start_time = Instant::now();
+
+        loop {
+            // Read a chunk from the file
+            let bytes_read = file.read(&mut buffer).await.map_err(|e| DriveError::FileReadError {
+                path: path_str.clone(),
+                source: e,
+            })?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            let chunk_data = &buffer[..bytes_read];
+            let chunk_end = bytes_uploaded + bytes_read as u64 - 1;
+            let content_range = format!("bytes {}-{}/{}", bytes_uploaded, chunk_end, file_size);
+
+            // Upload this chunk
+            let chunk_response = self
+                .http
+                .put(&upload_url)
+                .header("Content-Type", mime_type)
+                .header("Content-Length", bytes_read.to_string())
+                .header("Content-Range", &content_range)
+                .body(chunk_data.to_vec())
+                .send()
+                .await?;
+
+            let chunk_status = chunk_response.status();
+
+            // 308 Resume Incomplete means chunk was received, continue with next
+            // 200 or 201 means upload is complete
+            if chunk_status.as_u16() == 308 {
+                bytes_uploaded += bytes_read as u64;
+
+                // Report progress
+                if let Some(ref callback) = progress {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        bytes_uploaded as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+
+                    callback(UploadProgress {
+                        bytes_uploaded,
+                        total_bytes: file_size,
+                        bytes_per_second: speed,
+                    });
+                }
+            } else if chunk_status.is_success() {
+                // Upload complete - report 100% progress
+                if let Some(ref callback) = progress {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        file_size as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+
+                    callback(UploadProgress {
+                        bytes_uploaded: file_size,
+                        total_bytes: file_size,
+                        bytes_per_second: speed,
+                    });
+                }
+
+                let result_metadata: FileMetadata = chunk_response.json().await?;
+                return Ok(result_metadata);
+            } else {
+                let error_body = chunk_response.text().await.unwrap_or_default();
+                return Err(DriveError::ApiError {
+                    status: chunk_status.as_u16(),
+                    message: error_body,
+                });
+            }
         }
 
-        let metadata: FileMetadata = upload_response.json().await?;
-        Ok(metadata)
+        // If we reach here, something went wrong - the last chunk should have returned 200/201
+        Err(DriveError::ApiError {
+            status: 500,
+            message: "Upload completed but no final response received".to_string(),
+        })
     }
 
     /// Download a file to a local path.
@@ -397,15 +523,25 @@ impl SharedDriveClient {
         }
 
         // Stream to file
-        let mut file = File::create(&final_path).await?;
+        let path_str = final_path.display().to_string();
+        let mut file = File::create(&final_path).await.map_err(|e| DriveError::FileWriteError {
+            path: path_str.clone(),
+            source: e,
+        })?;
         let mut stream = response.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            file.write_all(&chunk).await?;
+            file.write_all(&chunk).await.map_err(|e| DriveError::FileWriteError {
+                path: path_str.clone(),
+                source: e,
+            })?;
         }
 
-        file.flush().await?;
+        file.flush().await.map_err(|e| DriveError::FileWriteError {
+            path: path_str,
+            source: e,
+        })?;
 
         Ok(metadata)
     }

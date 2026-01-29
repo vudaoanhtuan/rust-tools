@@ -1,12 +1,14 @@
 //! share_drive CLI - Interact with Google Shared Drive.
 
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use glob::glob;
 
-use share_drive::{extract_id, Authenticator, SharedDriveClient};
+use share_drive::{extract_id, Authenticator, SharedDriveClient, UploadProgress};
 
 /// CLI tool for interacting with Google Shared Drive.
 #[derive(Parser)]
@@ -132,13 +134,29 @@ async fn main() -> Result<()> {
             for (idx, file_path) in files_to_upload.iter().enumerate() {
                 let filename = file_path.file_name().unwrap_or_default().to_string_lossy();
                 print!("[{}/{}] Uploading {}... ", idx + 1, files_to_upload.len(), filename);
+                std::io::stdout().flush().ok();
 
-                match client.upload_file(file_path, &folder_id).await {
+                // Create progress callback for large files
+                let progress_callback: Arc<dyn Fn(UploadProgress) + Send + Sync> =
+                    Arc::new(|p: UploadProgress| {
+                        let percent = (p.bytes_uploaded as f64 / p.total_bytes as f64) * 100.0;
+                        let speed_mb = p.bytes_per_second / (1024.0 * 1024.0);
+                        print!("\r[{:.1}%] {:.2} MB/s   ", percent, speed_mb);
+                        std::io::stdout().flush().ok();
+                    });
+
+                match client
+                    .upload_file_with_progress(file_path, &folder_id, Some(progress_callback))
+                    .await
+                {
                     Ok(metadata) => {
-                        println!("OK ({})", metadata.id);
+                        // Clear the progress line and print success
+                        print!("\r[{}/{}] Uploading {}... OK ({})        \n", 
+                            idx + 1, files_to_upload.len(), filename, metadata.id);
                     }
                     Err(e) => {
-                        println!("FAILED");
+                        print!("\r[{}/{}] Uploading {}... FAILED        \n", 
+                            idx + 1, files_to_upload.len(), filename);
                         eprintln!("  Error: {}", e);
                     }
                 }

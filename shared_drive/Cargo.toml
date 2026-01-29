@@ -41,6 +41,7 @@ regex = "1.11"
 
 # Async utilities
 futures = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
 
 # Pin time crate to avoid edition2024 requirement
 time = "=0.3.36"

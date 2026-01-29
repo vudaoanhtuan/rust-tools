@@ -47,7 +47,8 @@ pub struct Authenticator {
 impl Authenticator {
     /// Create a new authenticator from a service account JSON file.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let content = fs::read_to_string(path)?;
+        let content = fs::read_to_string(path.as_ref())
+            .map_err(DriveError::CredentialsFileError)?;
         let credentials: ServiceAccountCredentials = serde_json::from_str(&content)?;
         Ok(Self::new(credentials))
     }

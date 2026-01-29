@@ -9,7 +9,19 @@ pub enum DriveError {
     AuthenticationError(String),
 
     #[error("Failed to read credentials file: {0}")]
-    CredentialsFileError(#[from] std::io::Error),
+    CredentialsFileError(std::io::Error),
+
+    #[error("Failed to read file '{path}': {source}")]
+    FileReadError {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[error("Failed to write file '{path}': {source}")]
+    FileWriteError {
+        path: String,
+        source: std::io::Error,
+    },
 
     #[error("Failed to parse credentials JSON: {0}")]
     CredentialsParseError(#[from] serde_json::Error),

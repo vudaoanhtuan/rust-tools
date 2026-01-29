@@ -3,7 +3,7 @@
 .bazelrc.user
 
 # Rust
-/target/
+target/
 **/*.rs.bk
 
 # IDE
